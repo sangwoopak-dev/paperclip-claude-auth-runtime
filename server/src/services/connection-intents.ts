@@ -1183,9 +1183,12 @@ export function connectionIntentService(db: Db) {
       const attribution = record(run.contextSnapshot?.aiConnection);
       if (attribution && attribution.provider !== binding.provider) return null;
       if ((saved || managed) && attribution && typeof attribution.identity === "string" && typeof attribution.connectionId === "string" && typeof attribution.grantId === "string") {
-        await aiConnectionService(db).markAuthenticationFailed({ companyId: run.companyId, runId: run.id, agentId: run.agentId,
+        const confirmed = await aiConnectionService(db).markAuthenticationFailed({ companyId: run.companyId, runId: run.id, agentId: run.agentId,
           runStartedAt: run.startedAt ?? run.createdAt,
+          errorCode: run.errorCode ?? "",
+          runResultJson: run.resultJson,
           attribution: attribution as unknown as AiConnectionAttribution & { identity: string } });
+        if (!confirmed) return null;
       }
       return requestWithContext(context, binding.provider, { purpose: "ai" });
     },

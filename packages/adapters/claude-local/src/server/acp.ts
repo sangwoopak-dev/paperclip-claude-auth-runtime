@@ -320,6 +320,19 @@ export function classifyClaudeTerminalSessionFailure(
   failure: AcpxTerminalSessionFailure,
   now: Date,
 ): AcpxTerminalFailureClassification | null {
+  const surface = { errorMessage: [failure.title, failure.details].filter(Boolean).join("\n") };
+  // Some Claude ACP builds have emitted quota wording with the broader
+  // `access` category. Prefer an explicit provider quota signal so an
+  // exhausted session or weekly window cannot enter connection auth repair.
+  const isQuotaFallback = failure.title === "The Claude account has no available quota.";
+  if (failure.category === "access" && (isQuotaFallback || isClaudeProviderQuotaError(surface))) {
+    const retryNotBefore = extractClaudeRetryNotBefore(surface, now)?.toISOString();
+    return {
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      ...(retryNotBefore ? { retryNotBefore } : {}),
+    };
+  }
   // Claude's typed AIR access category is emitted for auth_required. This is
   // a provider signal, including its generic fallback, not a tool permission
   // error inferred from text. Keep it on the existing sign-in recovery path.
@@ -327,10 +340,6 @@ export function classifyClaudeTerminalSessionFailure(
   // `limit` also includes context, turn, rate and configured budget limits.
   // Only the provider's quota wording qualifies for a quota wait.
   if (failure.category !== "limit") return null;
-  const surface = { errorMessage: [failure.title, failure.details].filter(Boolean).join("\n") };
-  // claude-agent-acp uses this exact quota_exhausted fallback when no provider
-  // title is available. It does not match the CLI's usage-limit wording.
-  const isQuotaFallback = failure.title === "The Claude account has no available quota.";
   if (!isQuotaFallback && !isClaudeProviderQuotaError(surface)) return null;
   const retryNotBefore = extractClaudeRetryNotBefore(surface, now)?.toISOString();
   return {

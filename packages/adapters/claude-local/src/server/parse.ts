@@ -207,7 +207,7 @@ export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
-}): { requiresLogin: boolean; loginUrl: string | null } {
+}): { requiresLogin: boolean; loginUrl: string | null; providerHttpStatus?: 401 } {
   const parsed = input.parsed ?? null;
   const resultText = asString(parsed?.result, "").trim();
 
@@ -228,10 +228,14 @@ export function detectClaudeLoginRequired(input: {
     parsed !== null &&
     claudeResultIndicatesAuthFailure(parsed) &&
     CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));
+  const status = parsed
+    ? asNumber(parsed.api_error_status, 0) || asNumber(parsed.error_status, 0)
+    : 0;
 
   return {
     requiresLogin: loginPrompt || tokenFailure,
     loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    ...(tokenFailure && status === 401 ? { providerHttpStatus: 401 as const } : {}),
   };
 }
 

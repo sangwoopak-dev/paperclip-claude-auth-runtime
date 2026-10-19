@@ -35,6 +35,7 @@ import { forbidden, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import { probeAiConnectionUsage } from "./ai-connection-usage.js";
+import { isAiAuthenticationFailure, isConfirmedClaudeExecutionAuthenticationFailure } from "./ai-auth-failure.js";
 
 /** Same human audience displayed by the existing Connections identity controls. */
 function canUseCredential(
@@ -810,8 +811,61 @@ export function aiConnectionService(db: Db) {
     runId?: string;
     agentId?: string;
     runStartedAt: Date;
+    errorCode: string;
+    runResultJson?: unknown;
+    providerHttpStatus?: number | null;
     attribution: AiConnectionAttribution & { identity: string };
-  }) {
+  }): Promise<boolean> {
+    if (!isAiAuthenticationFailure(input.errorCode)) return false;
+    const snapshot = await db.transaction(async (tx) => {
+      const { attribution } = input;
+      const [grant] = await tx.select().from(connectionGrants).where(and(
+        eq(connectionGrants.companyId, input.companyId),
+        eq(connectionGrants.id, attribution.grantId),
+        eq(connectionGrants.connectionId, attribution.connectionId),
+      ));
+      if (!grant) return null;
+      if (grant.status === "needs_reauthorization") return { alreadyInvalid: true as const };
+      if (grant.status !== "active" || grant.updatedAt > input.runStartedAt) return null;
+      const [connection] = await tx.select().from(toolConnections).where(and(
+        eq(toolConnections.companyId, input.companyId),
+        eq(toolConnections.id, attribution.connectionId),
+        eq(toolConnections.connectionPurpose, "ai"),
+      ));
+      if (!connection) return null;
+      const metadata = aiConnectionMetadataSchema.safeParse(connection.config.ai);
+      if (!metadata.success || metadata.data.provider !== attribution.provider || metadata.data.method !== attribution.method) return null;
+      const ref = grant.credentialSecretRefs.find((candidate) => candidate.configPath === "ai.credential");
+      if (!ref) return null;
+      const value = await aiConnectionService(tx as unknown as Db).credential({ connection, grant });
+      const generation = createHash("sha256").update(value).digest("hex").slice(0, 16);
+      if (attribution.identity !== `${grant.id}:${attribution.responsibleUserId ?? "shared"}:${generation}`) return null;
+      return { alreadyInvalid: false as const, grant, connection, metadata: metadata.data };
+    });
+    if (!snapshot) return false;
+    if (snapshot.alreadyInvalid) return true;
+
+    // Claude's usage endpoint is not an inference-auth oracle: setup-tokens may
+    // lack the profile scope needed to read usage. Only an actual failed Claude
+    // execution's 401 or explicit revoked-token diagnostic may latch a
+    // subscription grant. Unconfirmed failures remain ordinary failed Runs.
+    if (snapshot.metadata.provider === "anthropic" && snapshot.metadata.method === "subscription") {
+      const confirmed = isConfirmedClaudeExecutionAuthenticationFailure({
+        errorCode: input.errorCode,
+        resultJson: input.runResultJson,
+        providerHttpStatus: input.providerHttpStatus,
+      });
+      if (!confirmed) {
+        await logActivity(db, {
+          companyId: input.companyId, actorType: "system", actorId: input.runId ? "heartbeat" : "adapter_test",
+          agentId: input.agentId, runId: input.runId, action: "ai_connection.authentication_failed_unconfirmed",
+          entityType: "tool_connection", entityId: snapshot.connection.id,
+          details: { provider: snapshot.metadata.provider, grantId: snapshot.grant.id, runErrorCode: input.errorCode, verification: "no_execution_401_or_revoked_token_evidence" },
+        });
+        return false;
+      }
+    }
+
     return db.transaction(async (tx) => {
       const { attribution } = input;
       const [grant] = await tx.select().from(connectionGrants).where(and(
@@ -819,23 +873,25 @@ export function aiConnectionService(db: Db) {
         eq(connectionGrants.id, attribution.grantId),
         eq(connectionGrants.connectionId, attribution.connectionId),
       )).for("update");
-      if (!grant || grant.status !== "active" || grant.updatedAt > input.runStartedAt) return;
+      if (!grant) return false;
+      if (grant.status === "needs_reauthorization") return true;
+      if (grant.status !== "active" || grant.updatedAt > input.runStartedAt) return false;
       const [connection] = await tx.select().from(toolConnections).where(and(
         eq(toolConnections.companyId, input.companyId),
         eq(toolConnections.id, attribution.connectionId),
         eq(toolConnections.connectionPurpose, "ai"),
       ));
-      if (!connection) return;
+      if (!connection) return false;
       const metadata = aiConnectionMetadataSchema.safeParse(connection.config.ai);
-      if (!metadata.success || metadata.data.provider !== attribution.provider || metadata.data.method !== attribution.method) return;
+      if (!metadata.success || metadata.data.provider !== attribution.provider || metadata.data.method !== attribution.method) return false;
       const ref = grant.credentialSecretRefs.find((candidate) => candidate.configPath === "ai.credential");
-      if (!ref) return;
+      if (!ref) return false;
       await tx.select({ id: companySecrets.id }).from(companySecrets).where(and(
         eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, ref.secretId),
       )).for("update");
       const value = await aiConnectionService(tx as unknown as Db).credential({ connection, grant });
       const generation = createHash("sha256").update(value).digest("hex").slice(0, 16);
-      if (attribution.identity !== `${grant.id}:${attribution.responsibleUserId ?? "shared"}:${generation}`) return;
+      if (attribution.identity !== `${grant.id}:${attribution.responsibleUserId ?? "shared"}:${generation}`) return false;
       await tx.update(connectionGrants).set({ status: "needs_reauthorization", updatedAt: new Date() })
         .where(eq(connectionGrants.id, grant.id));
       await tx.update(toolConnections).set({ healthStatus: "error", healthMessage: "Sign in again to restore this AI connection.", updatedAt: new Date() })
@@ -846,6 +902,7 @@ export function aiConnectionService(db: Db) {
         entityType: "tool_connection", entityId: connection.id,
         details: { provider: attribution.provider, grantId: grant.id },
       });
+      return true;
     });
   }
   return { list, select, credential, probeUsage, save, setDefault, membership, markAuthenticationFailed };

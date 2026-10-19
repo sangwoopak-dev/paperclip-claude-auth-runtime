@@ -195,6 +195,16 @@ it.each([
 });
 
 it.each([
+  "You've hit your session limit · resets 4:30pm (America/Chicago)",
+  "You've hit your weekly limit",
+])("keeps explicit Claude quota wording out of auth recovery even when ACP labels it access: %s", (title) => {
+  expect(classifyClaudeTerminalSessionFailure({ category: "access", title }, now)).toMatchObject({
+    errorCode: "provider_quota",
+    errorFamily: "provider_quota",
+  });
+});
+
+it.each([
   "Permission denied while opening workspace file.",
   "Tool authorization denied.",
 ])("does not treat a tool or workspace request failure as a login rejection: %s", (title) => {

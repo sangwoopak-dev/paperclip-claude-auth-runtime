@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { aiBindingForAuthRecovery, isAiAuthenticationFailure } from "./ai-auth-failure.js";
+import { aiBindingForAuthRecovery, isAiAuthenticationFailure, isConfirmedClaudeExecutionAuthenticationFailure } from "./ai-auth-failure.js";
 
 describe("AI authentication failure recovery", () => {
   it.each(["acpx_auth_required", "claude_auth_required", "codex_auth_required", "grok_auth_required", "adapter_auth_missing", "refresh_token_reused", "refresh_token_expired", "refresh_token_invalidated"])("recognizes %s", (code) => {
@@ -7,6 +7,19 @@ describe("AI authentication failure recovery", () => {
   });
   it.each(["github_auth_required", "native_adopted_runner_authentication_timeout", "rate_limit", "adapter_failed", "permission_denied", undefined])("does not treat %s as model authentication", (code) => {
     expect(isAiAuthenticationFailure(code)).toBe(false);
+  });
+  it("confirms only direct Claude execution rejection evidence for subscription recovery", () => {
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "claude_auth_required", resultJson: { api_error_status: 401 } })).toBe(true);
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "claude_auth_required", resultJson: { api_error_status: 403 } })).toBe(false);
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "claude_auth_required", resultJson: { terminalSessionFailure: { category: "access", details: "OAuth access token revoked" } } })).toBe(true);
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "provider_quota", resultJson: { api_error_status: 401 } })).toBe(false);
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "claude_auth_required", resultJson: { terminalSessionFailure: { category: "access", details: "session quota exhausted" } } })).toBe(false);
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "claude_auth_required", providerHttpStatus: 401 })).toBe(true);
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "claude_auth_required", resultJson: { terminalSessionFailure: { category: "access", title: "Authentication required (HTTP 401)" } } })).toBe(true);
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "claude_auth_required", resultJson: { terminalSessionFailure: { category: "access", title: "HTTP: 401 - sign in required" } } })).toBe(true);
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "claude_auth_required", resultJson: { terminalSessionFailure: { category: "access", title: "Authorization denied (HTTP 403)" } } })).toBe(false);
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "claude_auth_required", resultJson: { terminalSessionFailure: { category: "service", title: "Authentication required (HTTP 401)" } } })).toBe(false);
+    expect(isConfirmedClaudeExecutionAuthenticationFailure({ errorCode: "claude_auth_required", resultJson: { terminalSessionFailure: { category: "access", title: "Authentication required", details: "Unrelated HTTP 401 in diagnostic context" } } })).toBe(false);
   });
   it.each([
     ["codex_local", {}, "openai"],

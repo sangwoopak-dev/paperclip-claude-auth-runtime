@@ -423,6 +423,7 @@ export async function testEnvironment(
           code: "claude_hello_probe_auth_required",
           level: "warn",
           message: "Claude CLI is installed, but login is required.",
+          ...(loginMeta.providerHttpStatus === 401 ? { detail: "provider_http_status=401" } : {}),
           hint: buildClaudeLoginRequiredHint(loginMeta.loginUrl),
         });
         if (targetIsSandbox) {

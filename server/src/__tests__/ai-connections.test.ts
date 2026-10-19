@@ -172,6 +172,150 @@ describe("managed AI connections", () => {
     expect((await service.select({ companyId, agentId: id, userId, adapterType, binding: selectedBinding })).grant.status).toBe("active");
   });
 
+  it("does not create an authentication repair intent for Claude provider quota failures", async () => {
+    const userId = "claude-quota-intent";
+    const id = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({ id, companyId, name: "Claude quota intent", adapterType: "claude_local" });
+    const account = await service.save(companyId, userId, { provider: "anthropic", method: "subscription", ownership: "personal", name: "Claude quota account", loginSessionId: "fixture", agentIds: [id], allAgents: false }, "fixture-setup-token");
+    await service.setDefault(companyId, userId, account.grantId);
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: id, status: "failed", errorCode: "provider_quota", responsibleUserId: userId,
+      resultJson: { errorFamily: "provider_quota" }, contextSnapshot: {} });
+    const intents = connectionIntentService(db);
+    expect(await intents.requestForRunAuthFailure(runId)).toBeNull();
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId));
+    expect(grant!.status).toBe("active");
+  });
+
+  it.each([
+    ["usage success", 200, false],
+    ["usage permission denied", 403, false],
+    ["usage authentication denied without a known usage scope", 401, false],
+    ["usage network timeout", "timeout", false],
+  ] as const)("does not infer inference-token validity from %s", async (label, usageStatus) => {
+    const userId = `claude-auth-confirmation-${String(label).replace(/\W+/g, "-")}`;
+    const id = randomUUID();
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    const selectedBinding = { provider: "anthropic", method: "subscription", mode: "responsible_user" } as const;
+    await db.insert(agents).values({ id, companyId, name: "Claude auth confirmation", adapterType: "claude_local", runtimeConfig: { aiConnection: selectedBinding } });
+    const account = await service.save(companyId, userId, { provider: "anthropic", method: "subscription", ownership: "personal", name: "Claude setup token", loginSessionId: "fixture", agentIds: [id], allAgents: false }, "fixture-valid-setup-token");
+    await service.setDefault(companyId, userId, account.grantId);
+    const runtime = await prepareManagedAiRuntime(db, { companyId, agentId: id, responsibleUserId: userId, adapterType: "claude_local", binding: selectedBinding, config: {} });
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Claude usage scope readback", status: "in_progress", assigneeAgentId: id });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: id, status: "failed", errorCode: "claude_auth_required", responsibleUserId: userId, resultJson: { error: "authentication_failed" }, contextSnapshot: {} });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, aiConnection: { ...runtime.attribution, identity: runtime.identity } } }).where(eq(heartbeatRuns.id, runId));
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      if (usageStatus === "timeout") throw new Error("fixture provider timeout");
+      if (usageStatus === 200) return new Response(JSON.stringify({ five_hour: { utilization: 100 }, seven_day: { utilization: 100 } }), { status: 200 });
+      return new Response("fixture provider response", { status: usageStatus });
+    });
+    try {
+      const usage = await service.probeUsage(companyId, userId, account.connectionId, account.grantId);
+      expect(usage.errorCode).toBe(usageStatus === 200 ? undefined : usageStatus === "timeout" ? "provider_unavailable" : usageStatus === 403 ? "permission_denied" : "authentication_required");
+      const confirmed = await service.markAuthenticationFailed({ companyId, runId, agentId: id,
+        runStartedAt: new Date(), errorCode: "claude_auth_required", runResultJson: { error: "authentication_failed" },
+        attribution: { ...runtime.attribution, identity: runtime.identity } });
+      expect(confirmed).toBe(false);
+      const active = await service.select({ companyId, agentId: id, userId, adapterType: "claude_local", binding: selectedBinding });
+      expect(active.grant.status).toBe("active");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0]?.[0]).toBe("https://api.anthropic.com/api/oauth/usage");
+      fetchSpy.mockClear();
+      const intent = await connectionIntentService(db).requestForRunAuthFailure(runId);
+      expect(intent).toBeNull();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      await runtime.cleanup();
+    }
+  });
+
+  it("uses a Claude execution 401 even when the usage endpoint denies profile scope", async () => {
+    const userId = "claude-usage-forbidden-execution-401";
+    const id = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    const selectedBinding = { provider: "anthropic", method: "subscription", mode: "responsible_user" } as const;
+    await db.insert(agents).values({ id, companyId, name: "Claude actual 401", adapterType: "claude_local", runtimeConfig: { aiConnection: selectedBinding } });
+    const account = await service.save(companyId, userId, { provider: "anthropic", method: "subscription", ownership: "personal", name: "Claude setup token 403", loginSessionId: "fixture", agentIds: [id], allAgents: false }, "fixture-valid-setup-token");
+    const runtime = await prepareManagedAiRuntime(db, { companyId, agentId: id, responsibleUserId: userId, adapterType: "claude_local", binding: selectedBinding, config: {} });
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Claude confirmed auth failure", status: "in_progress", assigneeAgentId: id });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId: id, status: "failed", errorCode: "claude_auth_required", responsibleUserId: userId,
+      resultJson: { api_error_status: 401, error: "authentication_failed" },
+      contextSnapshot: { issueId, aiConnection: { ...runtime.attribution, identity: runtime.identity } } });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("usage scope denied", { status: 403 }));
+    try {
+      const usage = await service.probeUsage(companyId, userId, account.connectionId, account.grantId);
+      expect(usage).toMatchObject({ status: "unavailable", errorCode: "permission_denied" });
+      fetchSpy.mockClear();
+      const intent = await connectionIntentService(db).requestForRunAuthFailure(runId);
+      expect(intent).toMatchObject({ state: "needs_user_action", service: "anthropic" });
+      expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId)))[0]?.status).toBe("needs_reauthorization");
+      expect(fetchSpy).not.toHaveBeenCalled();
+      const reconnected = await service.save(companyId, userId, {
+        provider: "anthropic", method: "subscription", ownership: "personal", name: "Claude setup token reconnected",
+        connectionId: account.connectionId, loginSessionId: "fixture-reconnected", agentIds: [id], allAgents: false,
+      }, "fixture-reconnected-setup-token");
+      expect(reconnected.connectionId).toBe(account.connectionId);
+      expect(reconnected.grantId).toBe(account.grantId);
+      await connectionIntentService(db).complete(intent!.interactionId!, account.connectionId, userId);
+      expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId)))[0]?.status).toBe("active");
+    } finally { fetchSpy.mockRestore(); await runtime.cleanup(); }
+  });
+
+  it("does not apply a confirmed old Claude 401 to a replacement credential", async () => {
+    const userId = "claude-stale-auth-failure";
+    const id = randomUUID();
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({ id, companyId, name: "Claude stale failure", adapterType: "claude_local" });
+    const selectedBinding = { provider: "anthropic", method: "subscription", mode: "responsible_user" } as const;
+    const account = await service.save(companyId, userId, { provider: "anthropic", method: "subscription", ownership: "personal", name: "Claude replace token", loginSessionId: "fixture", agentIds: [id], allAgents: false }, "fixture-old-setup-token");
+    const runtime = await prepareManagedAiRuntime(db, { companyId, agentId: id, responsibleUserId: userId, adapterType: "claude_local", binding: selectedBinding, config: {} });
+    const oldRunStartedAt = new Date(Date.now() - 5_000);
+    const replaced = await service.save(companyId, userId, { provider: "anthropic", method: "subscription", ownership: "personal", name: "Claude replace token", connectionId: account.connectionId, loginSessionId: "fixture-new", agentIds: [id], allAgents: false }, "fixture-new-setup-token");
+    expect(replaced.grantId).toBe(account.grantId);
+    const rejected = await service.markAuthenticationFailed({ companyId, agentId: id, runStartedAt: oldRunStartedAt,
+      errorCode: "claude_auth_required", runResultJson: { api_error_status: 401 },
+      attribution: { ...runtime.attribution, identity: runtime.identity } });
+    expect(rejected).toBe(false);
+    expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId)))[0]?.status).toBe("active");
+    await runtime.cleanup();
+  });
+
+  it("deduplicates connection repair intents for ten simultaneous Claude auth-failure runs", async () => {
+    const userId = "claude-concurrent-auth-failures";
+    const id = randomUUID();
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({ id, companyId, name: "Claude concurrent recovery", adapterType: "claude_local",
+      runtimeConfig: { aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" } } });
+    const binding = { provider: "anthropic", method: "subscription", mode: "responsible_user" } as const;
+    const account = await service.save(companyId, userId, { provider: "anthropic", method: "subscription", ownership: "personal", name: "Concurrent setup token", loginSessionId: "fixture", agentIds: [id], allAgents: false }, "fixture-concurrent-setup-token");
+    const runtime = await prepareManagedAiRuntime(db, { companyId, agentId: id, responsibleUserId: userId, adapterType: "claude_local", binding, config: {} });
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Concurrent Claude failures", status: "in_progress", assigneeAgentId: id });
+    const runIds = Array.from({ length: 10 }, () => randomUUID());
+    const createdAt = Date.now() + 5_000;
+    await db.insert(heartbeatRuns).values(runIds.map((runId, index) => ({
+      id: runId, companyId, agentId: id, status: "failed", errorCode: "claude_auth_required", responsibleUserId: userId,
+      resultJson: { api_error_status: 401, error: "authentication_failed" },
+      contextSnapshot: { issueId, aiConnection: { ...runtime.attribution, identity: runtime.identity } },
+      createdAt: new Date(createdAt + index * 1_000),
+    })));
+    await runtime.cleanup();
+    const intents = connectionIntentService(db);
+    const requests = await Promise.all(runIds.flatMap(runId => [intents.requestForRunAuthFailure(runId), intents.requestForRunAuthFailure(runId)]));
+    expect(requests).toHaveLength(20);
+    const issued = requests.map(result => result?.interactionId).filter((value): value is string => Boolean(value));
+    expect(issued).toHaveLength(2);
+    expect(new Set(issued).size).toBe(1);
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId))).toHaveLength(1);
+    expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, account.grantId)))[0]?.status).toBe("needs_reauthorization");
+  });
+
   it("offers a compatible connection for legacy auth failures without silently adopting it", async () => {
     const id = randomUUID();
     const issueId = randomUUID();

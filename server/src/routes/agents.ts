@@ -3406,6 +3406,8 @@ export function agentRoutes(
     )) {
       await aiConnectionService(db).markAuthenticationFailed({
         companyId: context.companyId, agentId, runStartedAt: startedAt,
+        errorCode: "adapter_auth_missing",
+        providerHttpStatus: result.checks.some(check => check.detail === "provider_http_status=401") ? 401 : null,
         attribution: { ...managed.attribution, identity: managed.identity },
       });
     }

@@ -84,6 +84,17 @@ describe("detectClaudeLoginRequired", () => {
     ).toBe(true);
   });
 
+  it("retains only a provider execution 401 as credential rejection evidence", () => {
+    expect(detectClaudeLoginRequired({ parsed: {
+      is_error: true, subtype: "success", api_error_status: 401,
+      error: "authentication_failed", result: "Failed to authenticate. API Error: 401 Invalid bearer token",
+    }, stdout: "", stderr: "" })).toMatchObject({ requiresLogin: true, providerHttpStatus: 401 });
+    expect(detectClaudeLoginRequired({ parsed: {
+      is_error: true, subtype: "error", api_error_status: 403,
+      error: "permission_denied", result: "Usage permission denied for this token",
+    }, stdout: "", stderr: "" })).toMatchObject({ requiresLogin: false });
+  });
+
   it("does not classify a successful probe whose assistant text repeats a token phrase", () => {
     // A healthy run can print an auth phrase in its answer text. The parsed
     // result is a success, so the token-failure markers must not fire on the raw
